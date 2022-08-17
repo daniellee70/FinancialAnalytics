@@ -1,0 +1,314 @@
+---
+title: "Fama-French Factor Model"
+runtime: shiny
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+# Core
+library(tidyverse)
+library(tidyquant)
+
+# Shiny
+library(shiny)
+library(flexdashboard)
+
+# Importing data
+library(readr)
+
+# Interactive visualization
+library(plotly)
+
+# Modeling 
+library(broom)
+
+# Timeseries
+library(tibbletime)
+
+# Script
+source("../00_scripts/convert_prices_to_returns.R")
+```
+
+Column {.sidebar}
+-----------------------------------------------------------------------
+
+```{r}
+fluidRow(
+    column(6, textInput("stock1", "Stock 1", "SPY")),
+    column(5, numericInput("w1", "Portf. %", 25, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock2", "Stock 2", "EFA")),
+    column(5, numericInput("w2", "Portf. %", 25, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock3", "Stock 3", "IJS")),
+    column(5, numericInput("w3", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock4", "Stock 4", "EEM")),
+    column(5, numericInput("w4", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock5", "Stock 5", "AGG")),
+    column(5, numericInput("w5", "Portf. %", 10, min = 1, max = 100))
+)
+
+fluidRow(
+    column(7, dateInput("date", "Starting Date", "2013-01-01", format = "yyyy-mm-dd"))
+)
+
+actionButton("go", "Submit")
+
+```
+
+Row {data-width=500}
+-----------------------------------------------------------------------
+
+```{r}
+portfolio_returns_tbl <- eventReactive(input$go, {
+    
+    ## 1 Import stock prices ----
+
+    ## Choose stocks
+    
+    symbols <- c(input$stock1, input$stock2,
+                 input$stock3, input$stock4, input$stock5)
+    
+    ## Using tq_get() ----
+    prices <- tq_get(x = symbols,
+                     get = "stock.prices",
+                     from = input$date) %>%
+        
+        select(date, asset = symbol, prices = adjusted)
+    
+    ## 2 Convert prices to returns ----
+    
+    asset_returns_long_tbl <- convert_prices_to_returns(prices, period_returns = "monthly")
+    
+    ## 3 Build a portfolio ----
+    validate(need(input$w1+input$w2+input$w3+input$w4+input$w5 == 100,
+                  "The portfolio weights must sum to 100%!"))
+    
+    w <- c(input$w1 / 100,
+           input$w2 / 100,
+           input$w3 / 100,
+           input$w4 / 100,
+           input$w5 / 100)
+    
+    w_tbl <- tibble(symbols, w)
+    
+    portfolio_returns_tbl <- asset_returns_long_tbl %>%
+    
+        tq_portfolio(assets_col   = asset,
+                     returns_col  = returns,
+                     weights      = w_tbl,
+                     col_rename   = "returns",
+                     rebalance_on = "months")
+    
+    
+})
+
+# renderTable(portfolio_returns_tbl())
+```
+
+
+
+```{r}
+# 2 Fama-French
+
+ff_portfolio_returns_tbl <- eventReactive(input$go, {
+    
+    # 2.1 Download Fama-French data ----
+
+    # Create a temporary file, which delete itself upon exiting the R session
+    temp <- tempfile()
+    
+    # Create the URL
+    
+    base <- "http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/"
+    factor <- "F-F_Research_Data_Factors"
+    format <- "_CSV.zip"
+    
+    full_url <- paste0(base, factor, format)
+    
+    # Download data into the temp file
+    download.file(full_url, temp)
+    
+    # Unzip, read the data, and save it
+    # The textbook uses unz() inside the read_csv but is no longer necessary
+    Global_3_Factors_raw_tbl <- readr::read_csv(temp, skip = 3)
+    
+    ## 2.2 date ----
+    
+    Global_3_Factors_tbl <- Global_3_Factors_raw_tbl %>%
+    
+        # Convert date
+        mutate(date = ymd(parse_date_time(...1, "%Y%m"))) %>%
+    
+        # remove NAs, annual values
+        filter(!is.na(date)) %>%
+        select(date, everything(), -...1) %>%
+    
+        # Convert date to the last day of the month
+        mutate(date = rollforward(date))
+    
+    
+    ## 2.3 Merge with portfolio returns ----
+    
+    ff_portfolio_returns_tbl <- portfolio_returns_tbl() %>%
+    
+        # Move all dates to the last day of the month
+        mutate(date = rollforward(date)) %>%
+    
+        left_join(Global_3_Factors_tbl, by = "date") %>%
+    
+        # Convert percent to decimal
+        mutate(MKT_RF = `Mkt-RF` / 100,
+               SMB = SMB / 100,
+               HML = HML / 100,
+               RF = RF / 100,
+               R_excess = round(returns - RF, 4)) %>%
+        select(date, R_excess, MKT_RF, SMB, HML)
+
+})
+
+## 2.4 Modeling ----
+
+ff_model_tbl <- eventReactive(input$go, {
+    
+    ff_model_tbl <- ff_portfolio_returns_tbl() %>%
+
+        lm(R_excess ~ MKT_RF + SMB + HML, data = .) %>%
+    
+        broom::tidy(conf.int = TRUE, conf.level = .95) %>%
+    
+        mutate(across(where(is.numeric), ~round(., 3))) %>%
+    
+        select(term, beta = estimate, p.value, conf.low, conf.high)
+    
+})
+
+# renderTable(ff_model_tbl())
+```
+
+
+```{r}
+# 4 Rolling Fama-French ----
+
+rolling_ff_rsquared_tbl <- eventReactive(input$go, {
+    
+    # Define a rolling function
+    window <- 24
+    
+    rolling_lm <- tibbletime::rollify(.f = function(R_excess, MKT_RF, SMB, HML) lm(R_excess ~ MKT_RF + SMB + HML),
+                          window = window, unlist = FALSE)
+    
+    # Calculate rolling FF
+    rolling_ff_lm_tbl <- ff_portfolio_returns_tbl() %>%
+    
+        # Calculate rolling FF
+        mutate(rolling_ff = rolling_lm(R_excess, MKT_RF, SMB, HML)) %>%
+    
+        # Remove the first 23 rows
+        filter(!is.na(rolling_ff)) %>%
+    
+        select(date, rolling_ff)
+    
+    # Extract R-squared
+    rolling_ff_rsquared_tbl <- rolling_ff_lm_tbl %>%
+    
+        # Extract R-squared from lm object
+        mutate(glanced = map(.x = rolling_ff, .f = broom::glance)) %>%
+        unnest(glanced) %>%
+        select(date, r.squared, adj.r.squared, p.value) %>%
+        mutate(r.squared = r.squared %>% round(3))
+    
+})
+
+
+```
+
+
+### Rolling adjusted r squared
+
+```{r}
+
+renderPlotly({
+    
+    rolling_ff_rsquared_tbl() %>%
+
+        ggplot(aes(date, r.squared)) +
+        geom_line(color = "cornflowerblue") +
+    
+        scale_x_date(breaks = scales::pretty_breaks(n = 7)) +
+    
+        labs(title = "Rolling FF 3-FActor R-Squared",
+             x = NULL,
+             y = "R-squared") +
+        theme(plot.title = element_text(hjust = 0.5))
+    
+})
+
+
+```
+
+
+
+Row {data-width=500 .tabset .tabset-fade}
+-----------------------------------------------------------------------
+
+### Model Results
+
+```{r}
+
+renderTable({
+    
+    ff_model_tbl() %>%
+
+        filter(term != "(Intercept)")
+    
+})
+
+
+```
+
+### Betas
+
+```{r}
+
+renderPlotly({
+    
+    ff_model_tbl() %>%
+
+        filter(term != "(Intercept)") %>%
+    
+        ggplot() +
+        geom_errorbar(aes(x = term, y = beta,
+                          ymin = conf.low, ymax = conf.high,
+                          color = term),
+                      show.legend = FALSE) +
+    
+        labs(title    = "FF 3-Factor Coefficients",
+             subtitle = "balanced portfolio",
+             caption  = "data source: Fama-French website",
+             x        = NULL,
+             y        = "coefficient") +
+        theme(plot.title    = element_text(hjust = 0.5),
+              plot.subtitle = element_text(hjust = 0.5),
+              plot.caption  = element_text(hjust = 0))
+    
+})
+
+
+```
+
+
+

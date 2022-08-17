@@ -1,0 +1,283 @@
+---
+title: "Sharpe Ratio"
+runtime: shiny
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+# web app
+library(shiny)
+library(flexdashboard)
+
+# core
+library(tidyverse)
+library(tidyquant)
+
+# Interactive visualization
+library(plotly)
+
+# Scripts
+source("../00_scripts/convert_prices_to_returns.R")
+source("../00_scripts/calculate_rolling_sharpeRatio.R")
+```
+
+Column {.sidebar}
+-----------------------------------------------------------------------
+
+```{r}
+fluidRow(
+    column(6, textInput("stock1", "Stock 1", "SPY")),
+    column(5, numericInput("w1", "Portf %", 25, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock2", "Stock 2", "EFA")),
+    column(5, numericInput("w2", "Portf. %", 25, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock3", "Stock 3", "IJS")),
+    column(5, numericInput("w3", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock4", "Stock 4", "EEM")),
+    column(5, numericInput("w4", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock5", "Stock 5", "AGG")),
+    column(5, numericInput("w5", "Portf. %", 10, min = 1, max = 100))
+)
+
+fluidRow(
+    column(7, dateInput("date", "Starting Date", "2013-01-01", format = "yyyy-mm-dd"))
+)
+
+fluidRow(
+    column(6, numericInput("rfr", "RFR%", 0.03, min = 0, step = 0.01)),
+    column(5, numericInput("window", "Window", 12, min = 6, max = 36, step = 1))
+)
+
+actionButton(inputId = "go", label = "Submit")
+
+```
+
+Row {data-height=800}
+-----------------------------------------------------------------------
+
+```{r}
+# Asset returns
+
+asset_returns_long_tbl <- eventReactive(input$go, {
+    
+    # Import prices
+    symbols <- c(input$stock1, input$stock2,
+                 input$stock3, input$stock4, input$stock5)
+    
+    prices <- tq_get(x = symbols,
+                     get = "stock.prices", 
+                     from = input$date) %>%
+        select(date, asset = symbol, prices = adjusted)
+    
+    # Convert prices to returns
+    asset_returns_long_tbl <- convert_prices_to_returns(prices, period_returns = "monthly")
+})
+
+# renderTable(asset_returns_long_tbl())
+```
+
+
+```{r}
+# Portfolio returns
+
+portfolio_returns_tbl <- eventReactive(input$go, {
+    
+    # Assign weight
+    symbols <- c(input$stock1, input$stock2,
+                 input$stock3, input$stock4, input$stock5)
+    
+    validate(need(input$w1 + input$w2 + input$w3 + input$w4 + input$w5 == 100,
+                  "The portfolio weights must sum to 100%!"))
+    
+    w <- c(input$w1 / 100, 
+           input$w2 / 100, 
+           input$w3 / 100, 
+           input$w4 / 100, 
+           input$w5 / 100)
+    
+    w_tbl <- tibble(symbols, w)
+    
+    # Combine individual returns into portfolio
+    portfolio_returns_tbl <- asset_returns_long_tbl() %>%
+        
+        tq_portfolio(assets_col   = asset, 
+                     returns_col  = returns, 
+                     weights      = w_tbl, 
+                     col_rename   = "returns", 
+                     rebalance_on = "months")
+})
+
+# renderPrint(portfolio_returns_tbl() %>% glimpse())
+```
+
+
+
+```{r}
+
+rolling_sharpe_tbl_all <- eventReactive(input$go, {
+    
+    # Risk free rate
+    rfr <- input$rfr / 100
+    
+    calculate_rolling_sharpeRatio <- function(df) {
+    
+        SharpeRatio(df,
+                    Rf = rfr,
+                    FUN = "StdDev")
+    
+    }
+    
+    # Set the length of periods for rolling calculation
+    window <- input$window
+    
+    # Portfolio rolling sharpe ratio
+    rolling_sharpe_tbl <- portfolio_returns_tbl() %>%
+    
+        tq_mutate(select = returns,
+                  mutate_fun = rollapply,
+                  width = window,
+                  align = "right",
+                  FUN = calculate_rolling_sharpeRatio,
+                  col_rename = "sharpeRatio") %>%
+        na.omit()
+    
+    # SP500 rolling sharpe ratio
+    rolling_sharpe_tbl_SPY <- tq_get("SPY",
+                                    get = "stock.prices",
+                                    from = input$date) %>%
+        select(date, asset = symbol, prices = adjusted) %>%
+    
+        # Convert prices to returns
+        convert_prices_to_returns(period_returns = "monthly") %>%
+    
+        # Sharpe Ratio
+        tq_mutate(select = returns,
+                  mutate_fun = rollapply,
+                  width = window,
+                  align = "right",
+                  FUN = calculate_rolling_sharpeRatio,
+                  col_rename = "sharpeRatio") %>%
+        na.omit()
+    
+    rolling_sharpe_tbl_SPY
+    
+    # Combine sharpe ratios of portfolio and SP500
+    rolling_sharpe_tbl_all <- rolling_sharpe_tbl %>%
+        mutate(asset = "Portfolio") %>%
+    
+        bind_rows(rolling_sharpe_tbl_SPY)
+    
+})
+
+
+# renderTable(rolling_sharpe_tbl_all())
+```
+
+### Rolling Sharpe Ratio
+
+```{r}
+# Figure 7.5 Rolling Sharpe ggplot ----
+
+renderPlotly({
+    
+    rolling_sharpe_tbl_all() %>%
+
+        ggplot(aes(date, sharpeRatio, color = asset)) +
+        geom_line() +
+    
+        labs(title = paste0("Rolling ", input$window, "-Month Sharpe Ratio"),
+             y = "rolling Sharpe Ratio",
+             x = NULL,
+             color = NULL) +
+        theme(plot.title = element_text(hjust = 0.5))
+    
+})
+
+
+```
+
+Row {data-height=200}
+-----------------------------------------------------------------------
+
+```{r}
+# Sharpe Ratio of portfolio returns
+portfolio_sharpe_tbl <- eventReactive(input$go, {
+    
+    # Risk free rate
+    rfr <- input$rfr / 100
+    
+    portfolio_sharpe_tbl <- portfolio_returns_tbl() %>%
+    
+        tq_performance(Ra = returns,
+                       Rf = rfr,
+                       performance_fun = SharpeRatio,
+                       FUN = "StdDev") %>%
+        pull()
+    
+})
+
+
+```
+
+
+```{r}
+# Sharpe Ratio of the market
+market_sharpe_tbl <- eventReactive(input$go, {
+    
+    rfr <- input$rfr / 100
+    
+    market_sharpe_tbl <- tq_get("SPY",
+                                    get = "stock.prices",
+                                    from = input$date) %>%
+        select(date, asset = symbol, prices = adjusted) %>%
+    
+        # Convert prices to returns
+        convert_prices_to_returns(period_returns = "monthly") %>%
+    
+        # Calculate Sharpe Ratio
+        tq_performance(Ra = returns,
+                       Rf = rfr,
+                       performance_fun = SharpeRatio,
+                       FUN = "StdDev") %>%
+        pull()
+    
+})
+
+
+
+```
+
+### The Sharpe Ratio of Your Portfolio
+
+```{r}
+renderValueBox({
+    valueBox(value = tags$p(portfolio_sharpe_tbl() %>% round(4),
+                            style = "font-size: 70%;"),
+             color = "primary")
+})
+```
+
+### The Sharpe Ratio of S&P500 in the same time period
+
+```{r}
+renderValueBox({
+    valueBox(value = tags$p(market_sharpe_tbl() %>% round(4),
+                            style = "font-size: 70%;"),
+             color = "info")
+})
+```
+

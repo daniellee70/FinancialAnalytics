@@ -1,0 +1,207 @@
+---
+title: "Portfolio Returns Volatility"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+# Shiny
+library(shiny)
+library(flexdashboard)
+
+# Core
+library(tidyverse)
+library(tidyquant)
+
+# Interactive visualization
+library(plotly)
+
+# Scripts
+source("../00_scripts/convert_prices_to_returns.R")
+```
+
+User Input {.sidebar}
+-----------------------------------------------------------------------
+
+```{r}
+fluidRow(
+    column(6, textInput("stock1", "Stock 1", "SPY")),
+    column(5, numericInput("w1", "Portf. %", 25))
+)
+
+fluidRow(
+    column(6, textInput("stock2", "Stock 2", "EFA")),
+    column(5, numericInput("w2", "Portf. %", 25, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock3", "Stock 3", "IJS")),
+    column(5, numericInput("w3", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock4", "Stock 4", "EEM")),
+    column(5, numericInput("w4", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock5", "Stock 5", "AGG")),
+    column(5, numericInput("w5", "Portf. %", 10, min = 1, max = 100))
+)
+
+fluidRow(
+    column(7, dateInput("date", "Starting Date", "2013-01-01", format = "yyyy-mm-dd"))
+)
+
+fluidRow(
+    column(5, numericInput("window", "Window", 12, min = 3, max = 36, step = 1))
+)
+
+actionButton("go", "Submit")
+```
+
+Column {data-width=350}
+-----------------------------------------------------------------------
+
+
+```{r}
+asset_returns_long_tbl <- eventReactive(input$go, {
+    
+    ## Import stock prices ----
+    
+    symbols <- c(input$stock1, input$stock2,
+                 input$stock3, input$stock4, input$stock5)
+    
+    prices <- tq_get(x = symbols,
+                     get = "stock.prices",
+                     from = "2012-12-31",
+                     to = "2017-12-31") %>%
+    
+        select(date, asset = symbol, prices = adjusted)
+    
+    ## Convert prices to returns
+    
+    asset_returns_long_tbl <- convert_prices_to_returns(prices, period_returns = "monthly")
+    
+})
+
+# renderTable(asset_returns_long_tbl())
+```
+
+
+```{r}
+portfolio_returns_tbl <- eventReactive(input$go, {
+    
+    symbols <- c(input$stock1, input$stock2,
+                 input$stock3, input$stock4, input$stock5)
+    
+    w <- c(input$w1 / 100,
+           input$w2 / 100,
+           input$w3 / 100,
+           input$w4 / 100,
+           input$w5 / 100)
+    
+    w_tbl <- tibble(symbols, w)
+    
+    
+    portfolio_returns_tbl <- asset_returns_long_tbl() %>%
+    
+        tq_portfolio(assets_col   = asset,
+                     returns_col  = returns,
+                     weights      = w_tbl,
+                     col_rename   = "returns",
+                     rebalance_on = "months")
+    
+})
+
+# renderTable(portfolio_returns_tbl())
+```
+
+
+### Expected returns versus risk
+
+```{r}
+# Figure 4.5 Expected Returns versus Risk
+
+output$returns_risk_plot <- renderPlotly({
+    
+    # Transform data
+    asset_returns_sd_mean_tbl <- asset_returns_long_tbl() %>%
+
+    group_by(asset) %>%
+    tq_performance(Ra = returns,
+                   Rb = NULL,
+                   performance_fun = table.Stats) %>%
+
+    select(asset, Mean = ArithmeticMean, Stdev) %>%
+    ungroup() %>%
+
+    add_row(tibble(asset = "Portfolio",
+                   Mean  = mean(portfolio_returns_tbl()$returns),
+                   Stdev = sd(portfolio_returns_tbl()$returns))) %>%
+        
+    # Make a plot
+
+    ggplot(aes(Stdev, Mean, col = asset)) +
+    geom_point() +
+    ggrepel::geom_text_repel(aes(label = asset))
+    
+})
+
+plotlyOutput(outputId = "returns_risk_plot")
+
+```
+
+
+
+### rolling volatility
+
+```{r}
+
+port_rolling_sd_tbl <- eventReactive(input$go, {
+    
+    # Assign a value to winder
+    window <- input$window
+    
+    port_rolling_sd_tbl <- portfolio_returns_tbl() %>%
+    
+        tq_mutate(select = returns,
+                  mutate_fun = rollapply,
+                  width      = window,
+                  FUN        = sd,
+                  col_rename = "rolling_sd") %>%
+        select(date, rolling_sd) %>%
+        na.omit()
+    
+})
+
+
+# Figure 4.7 Rolling Volatility ggplot ----
+
+output$rollingSD_plot <- renderPlotly({
+    
+    port_rolling_sd_tbl() %>%
+
+    ggplot(aes(date, rolling_sd)) +
+    geom_line(color = "cornflowerblue") +
+
+    scale_y_continuous(labels = scales::percent) +
+    scale_x_date(breaks = scales::breaks_pretty(n = 7))+
+
+    labs(title = paste0(input$window, "-Month Rolling Volatility"),
+         x = NULL,
+         y = NULL) +
+    theme(plot.title = element_text(hjust = 0.5))
+    
+})
+
+plotlyOutput(outputId = "rollingSD_plot")
+
+
+
+
+```
+

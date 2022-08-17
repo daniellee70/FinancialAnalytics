@@ -1,0 +1,222 @@
+---
+title: "Monte Carlo Simulation of Portfolio Returns"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: columns
+    vertical_layout: fill
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+# shiny
+library(flexdashboard)
+library(shiny)
+
+# core
+library(tidyverse)
+library(tidyquant)
+
+# interactive visualization
+library(plotly)
+
+# functions
+source("../00_scripts/convert_prices_to_returns.R")
+source("../00_scripts/simulate_acculation.R")
+```
+
+Use Input {.sidebar}
+-----------------------------------------------------------------------
+
+```{r}
+fluidRow(
+    column(6, textInput("stock1", "Stock 1", "SPY")),
+    column(5, numericInput("w1", "Portf. %", 25, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock2", "Stock 2", "EFA")),
+    column(5, numericInput("w2", "Portf. %", 25, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock3", "Stock 3", "IJS")),
+    column(5, numericInput("w3", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock4", "Stock 4", "EEM")),
+    column(5, numericInput("w4", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock5", "Stock 5", "AGG")),
+    column(5, numericInput("w5", "Portf. %", 10, min = 1, max = 100))
+)
+
+fluidRow(
+    column(7, dateInput("date", "Starting Date", "2013-01-01", format = "yyyy-mm-dd"))
+)
+
+fluidRow(
+    column(6, selectInput("rebalance", "rebal freq", 
+                         c("Yearly" = "years", "Monthly" = "months", "Weekly" = "weeks")))
+)
+
+fluidRow(
+    column(5, numericInput("sim_months", "Months", 120, min = 6, max = 240, step = 6)),
+    column(5, numericInput("sims_n", "Sims", 51, min = 31, max = 101, step = 10))
+)
+
+actionButton("go", "Submit")
+
+```
+
+Column {data-width=350}
+-----------------------------------------------------------------------
+
+```{r}
+# Portfolio returns
+
+portfolio_returns_tbl <- eventReactive(input$go, {
+    
+    ## 1 Import stock prices ----
+    
+    symbols <- c(input$stock1, input$stock2,
+                 input$stock3, input$stock4, input$stock5)
+    
+    prices <- tq_get(x = symbols,
+                     get = "stock.prices",
+                     from = "2012-12-31",
+                     to = "2017-12-31") %>%
+    
+        select(date, asset = symbol, prices = adjusted)
+    
+    ## 2 Convert prices to returns ----
+    
+    asset_returns_long_tbl <- convert_prices_to_returns(prices, period_returns = "monthly")
+    
+    
+    ## 3 Build a portfolio ----
+
+    w <- c(input$w1 / 100,
+           input$w2 / 100,
+           input$w3 / 100,
+           input$w4 / 100,
+           input$w5 / 100)
+    
+    w_tbl <- tibble(symbols, w)
+    
+    
+    portfolio_returns_tbl <- asset_returns_long_tbl %>%
+    
+        tq_portfolio(assets_col   = asset,
+                     returns_col  = returns,
+                     weights      = w_tbl,
+                     col_rename   = "returns",
+                     rebalance_on = input$rebalance)
+    
+})
+
+renderPrint(portfolio_returns_tbl())
+```
+
+
+```{r}
+# Simulate future portfolio returns
+
+monte_carlo_sim_51 <- eventReactive(input$go, {
+    
+    # 1 Get mean and sd of returns ----
+    
+    mean_port_return <- mean(portfolio_returns_tbl()$returns)
+    stddev_port_return <- sd(portfolio_returns_tbl()$returns)
+    
+    
+    # 3 Run simulations ----
+    
+    # Create a vector of 1s as a starting point
+    sims <- input$sims_n
+    starts <- rep(1, sims) %>%
+        set_names(paste("sim", 1:sims, sep = ""))
+    
+    # Simulate
+    monte_carlo_sim_51 <- starts %>%
+    
+        # Simulate
+        map_dfc(simulate_acculation,
+                N     = input$sim_months,
+                mean  = mean_port_return,
+                stdev = stddev_port_return) %>%
+    
+        # Add the column, month
+        mutate(month = seq(1:nrow(.))) %>%
+    
+        # Arrange column names
+        select(month, everything()) %>%
+        set_names(c("month", names(starts))) %>%
+    
+        # Transform data to long form
+        pivot_longer(cols = -month, names_to = "sim", values_to = "growth")
+
+    
+})
+
+```
+
+
+### Sim Vis Plotly
+
+```{r}
+
+output$sim_vis <- renderPlotly({
+    
+    g <- monte_carlo_sim_51() %>%
+
+        ggplot(aes(x = month, y = growth, col = sim)) +
+        geom_line() +
+        theme(legend.position = "none")
+    
+    ggplotly(g)
+    
+})
+
+plotlyOutput(outputId = "sim_vis")
+```
+
+
+### Min, Max, Median Sim
+
+```{r}
+# Simplify the plot
+
+output$simple_sim_vis <- renderPlotly({
+    
+    sim_summary <- monte_carlo_sim_51() %>%
+    
+        group_by(sim) %>%
+        summarise(growth = last(growth)) %>%
+        ungroup() %>%
+    
+        summarise(max = max(growth),
+                  median = median(growth),
+                  min = min(growth))
+            
+    g <- monte_carlo_sim_51() %>%
+
+        group_by(sim) %>%
+        filter(last(growth) == sim_summary$max |
+               last(growth) == sim_summary$median |
+               last(growth) == sim_summary$min) %>%
+    
+        # Plot
+        ggplot(aes(month, growth, col = sim)) +
+        geom_line() +
+        theme()
+    
+    ggplotly(g)
+    
+})
+
+plotlyOutput(outputId = "simple_sim_vis")
+```
+

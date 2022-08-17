@@ -1,0 +1,235 @@
+---
+title: "Portfolio Skewness and Kurtosis"
+runtime: shiny
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+# web app
+library(shiny)
+library(flexdashboard)
+
+# core
+library(tidyverse)
+library(tidyquant)
+
+# Interactive visualization
+library(plotly)
+
+# Scripts
+source("../00_scripts/convert_prices_to_returns.R")
+```
+
+Column {.sidebar}
+-----------------------------------------------------------------------
+
+```{r}
+fluidRow(
+    column(6, textInput("stock1", "Stock 1", "SPY")),
+    column(5, numericInput("w1", "Portf %", 25, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock2", "Stock 2", "EFA")),
+    column(5, numericInput("w2", "Portf. %", 25, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock3", "Stock 3", "IJS")),
+    column(5, numericInput("w3", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock4", "Stock 4", "EEM")),
+    column(5, numericInput("w4", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock5", "Stock 5", "AGG")),
+    column(5, numericInput("w5", "Portf. %", 10, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, dateInput("date", "Starting Date", "2013-01-01", format = "yyyy-mm-dd")),
+    column(5, numericInput("window", "Window", 12, min = 6, max = 36, step = 1))
+)
+
+actionButton("go", "Submit")
+```
+
+
+Column {data-width=350, .tabset}
+-----------------------------------------------------------------------
+
+
+```{r}
+# portfolio returns
+
+portfolio_returns_tbl <- eventReactive(input$go, {
+    
+    # 1 Import stock prices
+    symbols <- c(input$stock1, input$stock2,
+                 input$stock3, input$stock4, input$stock5)
+    
+    prices <- tq_get(x = symbols,
+                     get = "stock.prices",
+                     from = input$date) %>%
+        
+        select(date, asset = symbol, prices = adjusted)
+    
+    # 2 Convert prices to returns
+    
+    asset_returns_long_tbl <- convert_prices_to_returns(prices, period_returns = "monthly")
+    
+    # 3 Combine indivisual returns to portfolio
+    
+    w <- c(input$w1 / 100,
+           input$w2 / 100,
+           input$w3 / 100,
+           input$w4 / 100,
+           input$w5 / 100)
+    
+    w_tbl <- tibble(symbols, w)
+    
+    
+    portfolio_returns_tbl <- asset_returns_long_tbl %>%
+        
+        tq_portfolio(assets_col = asset, 
+                     returns_col = returns,
+                     weights = w_tbl, 
+                     col_rename = "returns", 
+                     rebalance_on = "months")
+    
+})
+
+# renderTable(portfolio_returns_tbl())
+```
+
+
+
+
+### Rolling Skewness
+
+```{r}
+# Figure 4.8 Rolling skewness ggplot ----
+
+# Assign a value to winder
+port_rolling_skew_tbl <- eventReactive(input$go, {
+    
+    window <- input$window
+
+    port_rolling_skew_tbl <- portfolio_returns_tbl() %>%
+    
+        tq_mutate(select = returns,
+                  mutate_fun = rollapply,
+                  width      = window,
+                  FUN        = skewness,
+                  col_rename = "rolling_skew") %>%
+        select(date, rolling_skew) %>%
+        na.omit()
+    
+})
+
+
+
+output$rolling_skew_plot <- renderPlotly(
+    
+    port_rolling_skew_tbl() %>%
+
+        ggplot(aes(date, rolling_skew)) +
+        geom_line(color = "cornflowerblue") +
+        # geom_hline(yintercept = 0, linetype = "dotted", size = 2) +
+
+        # scale_y_continuous(limits = c(-1,1),
+        #                    breaks = scales::pretty_breaks(n = 10)) +
+        # scale_x_date(breaks = scales::breaks_pretty(n = 7))+
+
+        labs(title = paste0("Rolling ", input$window, "-Month Skew"),
+             x = NULL,
+             y = "skewness") +
+        theme(plot.title = element_text(hjust = 0.5)) 
+    
+)
+
+plotlyOutput(outputId = "rolling_skew_plot")
+```
+
+### Rolling KUrtosis
+
+```{r}
+# Figure 6.5 Rolling kurtosis ggplot ----
+
+# Assign a value to winder
+port_rolling_kurtosis_tbl <- eventReactive(input$go, {
+    
+    window <- input$window
+
+    port_rolling_kurtosis_tbl <- portfolio_returns_tbl() %>%
+    
+        tq_mutate(select = returns,
+                  mutate_fun = rollapply,
+                  width      = window,
+                  FUN        = kurtosis,
+                  col_rename = "rolling_kurtosis") %>%
+        select(date, rolling_kurtosis) %>%
+        na.omit()
+    
+})
+
+
+output$rolling_kurtosis_plot <- renderPlotly({
+    
+    port_rolling_kurtosis_tbl() %>%
+
+        ggplot(aes(date, rolling_kurtosis)) +
+        geom_line(color = "cornflowerblue") +
+    
+        # scale_y_continuous(breaks = scales::pretty_breaks(n = 10)) +
+        # scale_x_date(breaks = scales::breaks_pretty(n = 7)) +
+    
+        labs(title = paste0("Rolling ", input$window, "-Month Kurtosis"),
+             x = NULL,
+             y = "kurtosis") +
+        theme(plot.title = element_text(hjust = 0.5))
+    
+})
+
+plotlyOutput(outputId = "rolling_kurtosis_plot")
+
+```
+
+Column {data-width=350, .tabset}
+-----------------------------------------------------------------------
+
+### Portfolio Returns Distribution
+
+```{r}
+
+output$histogram_num_thresh <- renderPlotly({
+    
+    portfolio_returns_tbl() %>%
+
+        # Create a new variable for shade
+        mutate(returns_extreme = case_when(
+            returns < mean(returns) - 2*sd(returns) ~ "extreme_neg",
+            returns > mean(returns) + 2*sd(returns) ~ "extreme_pos",
+            TRUE                                    ~ "typical"
+        )) %>%
+    
+        # Plot
+        ggplot(aes(returns, fill = returns_extreme)) +
+        geom_histogram(alpha = .7,
+                       binwidth = .003) +
+    
+        scale_x_continuous(breaks = scales::pretty_breaks(n = 8)) +
+        scale_fill_tq() +
+    
+        labs(x = "monthly returns")
+    
+})
+
+plotlyOutput(outputId = "histogram_num_thresh")
+```

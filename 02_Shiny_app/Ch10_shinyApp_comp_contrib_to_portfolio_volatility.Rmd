@@ -1,0 +1,205 @@
+---
+title: "Component Contribution to Portfolio Volatility"
+runtime: shiny
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+---
+
+```{r setup, include=FALSE}
+
+# Core
+library(tidyverse)
+library(tidyquant)
+
+# shinyapp
+library(shiny)
+library(flexdashboard)
+
+# interative visualization
+library(plotly)
+
+source(file = "../00_scripts/convert_prices_to_returns.R")
+source(file = "../00_scripts/calculate_comp_contrib_to_portfolio_volatility.R")
+```
+
+Column {.sidebar}
+-----------------------------------------------------------------------
+
+```{r}
+fluidRow(
+    column(6, textInput("stock1", "Stock 1", "SPY")),
+    column(5, numericInput("w1", "Portf. %", 25, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock2", "Stock 2", "EFA")),
+    column(5, numericInput("w2", "Portf. %", 25, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock3", "Stock 3", "IJS")),
+    column(5, numericInput("w3", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock4", "Stock 4", "EEM")),
+    column(5, numericInput("w4", "Portf. %", 20, min = 1, max = 100))
+)
+
+fluidRow(
+    column(6, textInput("stock5", "Stock 5", "AGG")),
+    column(5, numericInput("w5", "Portf. %", 10, min = 1, max = 100))
+)
+
+fluidRow(
+    column(7, dateInput("date", "Starting Date", "2013-01-01", format = "yyyy-mm-dd"))
+)
+
+fluidRow(
+    column(5, numericInput("window", "Window", 12, min = 6, max = 36, step = 1))
+)
+
+actionButton("go", "Submit")
+
+```
+
+Row {data-height=500 .tabset .tabset-fade}
+-----------------------------------------------------------------------
+
+```{r}
+# Asset returns
+asset_returns_wide_tbl <- eventReactive(input$go, {
+    
+    # Import stock prices
+    symbols <- c(input$stock1, input$stock2,
+                 input$stock3, input$stock4, input$stock5)
+    
+    prices <- tq_get(symbols,
+                     get = "stock.prices",
+                     from = input$date) %>%
+        
+        select(date, asset = symbol, prices = adjusted)
+    
+    # Convert prices to returns
+    asset_returns_long_tbl <- convert_prices_to_returns(prices, period_returns = "monthly")
+    
+    # Transform data into wide form
+    asset_returns_wide_tbl <- asset_returns_long_tbl %>%
+    
+        pivot_wider(names_from = asset, values_from = returns) %>%
+    
+        column_to_rownames(var = "date")
+})
+
+# renderTable(asset_returns_wide_tbl())
+```
+
+
+
+```{r}
+# Rolling component contribution 
+
+w <- eventReactive(input$go, {
+    
+    # Iterate the custom function
+    validate(need(input$w1+input$w2+input$w3+input$w4+input$w5 == 100,
+                  "Portfolio weights must sum up to 100%!"))
+    w <- c(input$w1 / 100, 
+           input$w2 / 100, 
+           input$w3 / 100, 
+           input$w4 / 100, 
+           input$w5 / 100)
+    
+})
+
+rolling_comp_contrib_tbl <- eventReactive(input$go, {
+
+    window <- input$window
+    
+    rolling_comp_contrib_tbl <- 1:(nrow(asset_returns_wide_tbl()) - window) %>%
+    
+        map_df(.x = ., .f = ~calculate_comp_contrib_by_window(asset_returns_wide_tbl(),
+                                                              start = .x,
+                                                              weights = w(),
+                                                              window = window))
+    
+})
+
+# renderTable(rolling_comp_contrib_tbl())
+```
+
+
+### Asset Contribution Line Chart
+
+```{r}
+# Figure 10.3 Component Contribution ggplot ----
+renderPlotly({
+    
+    rolling_comp_contrib_tbl() %>%
+
+    # Transform data to long form
+    pivot_longer(cols = -date, names_to = "asset", values_to = "contribution") %>%
+
+    # Plot
+    ggplot(aes(date, contribution, color = asset)) +
+    geom_line() +
+
+    scale_x_date(breaks = scales::pretty_breaks(n = 7)) +
+    scale_y_continuous(labels = scales::percent_format())
+    
+})
+
+```
+
+### Asset Contribution Stacked Area Chart
+
+```{r}
+# Figure 10.4 Stacked Component Contribution ggplot ----  
+renderPlotly({
+    
+    rolling_comp_contrib_tbl() %>%
+
+        # Transform data to long form
+        pivot_longer(cols = -date, names_to = "asset", values_to = "contribution") %>%
+    
+        # Plot
+        ggplot(aes(date, contribution, fill = asset)) +
+        geom_area() +
+    
+        scale_x_date(breaks = scales::pretty_breaks(n = 7)) +
+        scale_y_continuous(labels = scales::percent_format())
+    
+})
+
+```
+
+Row {data-height=500}
+-----------------------------------------------------------------------
+
+### bar chart with weights
+
+```{r}
+renderPlotly({
+
+    asset_returns_wide_tbl() %>%
+
+        calculate_component_contribution(w = w()) %>%
+        gather(key = "asset", value = "contribution") %>%
+        add_column(weights = w()) %>%
+        pivot_longer(cols = c(contribution, weights), names_to = "type", values_to = "value") %>%
+    
+        ggplot(aes(asset, value, fill = type)) +
+        geom_col(position = "dodge") +
+    
+        labs(title = "Percent Contribution to Volatility",
+             y = "percent",
+             x = "asset") +
+        theme(plot.title = element_text(hjust = 0.5))
+    
+})
+
+
+```
+

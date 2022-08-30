@@ -1,5 +1,3 @@
-# TESTINg
-
 ## CHAPTER 2 Returns: ASSET PRICES TO RETURNS ----
 
 ## Goal ----
